@@ -1,0 +1,433 @@
+#!/bin/sh
+
+display_books() {
+    clear
+    echo -e "
+  _____                     _     
+ / ____|                   | |    
+| (___   ___  __ _ _ __ ___| |__  
+ \___ \ / _ \/ _\` | '__/ __| '_ \\ 
+ ____) |  __/ (_| | | | (__| | | |
+|_____/ \___|\__,_|_|  \___|_| |_|
+"
+    echo "--------------------------------"
+    echo "Source: $(cat "$TMP_DIR"/last_search_source 2>/dev/null)"
+    echo ""
+
+    local books="$1"
+    local page="$2"
+    local has_prev="$3"
+    local has_next="$4"
+    local last_page="$5"
+
+    local count
+    count="$(echo "$books" | grep -o '"title":' | wc -l)"
+
+    local display_index=1
+    local start=$(( (page - 1) * RESULTS_PER_PAGE ))
+    local end=$(( start + RESULTS_PER_PAGE - 1 ))
+    [ "$end" -ge "$count" ] && end=$((count - 1))
+
+    i=$((end))
+    while [ "$i" -ge "$start" ]; do
+        book_info="$(echo "$books" | awk -v i=$i 'BEGIN{RS="\\{"; FS="\\}"} NR==i+2{print $1}')"
+
+        title="$(get_json_value "$book_info" "title")"
+        author="$(get_json_value "$book_info" "author")"
+        format="$(get_json_value "$book_info" "format")"
+        description="$(get_json_value "$book_info" "description")"
+
+        if [ "$COMPACT_OUTPUT" != true ]; then
+            printf "%2d. %s\n" "$((i+1))" "$title"
+            [ -n "$description" ] && [ "$description" != "null" ] && echo "    $description"
+            echo ""
+        else
+            printf "%2d. %s by %s in %s format\n" \
+                "$((i+1))" "$title" "$author" "$format"
+            echo ""
+        fi
+
+        display_index=$((display_index + 1))
+        i=$((i - 1))
+    done
+
+    local items_on_page=$(( end - start + 1 ))
+
+    echo "--------------------------------"
+    echo ""
+    echo "Page $page of $last_page"
+    echo ""
+
+    [ "$has_prev" = true ] && echo -n "p: Previous page | "
+    echo -n "t[1-$last_page]: Select page | "
+    [ "$has_next" = true ] && echo -n "n: Next page | "
+    echo "1-$items_on_page: Select book | q: Quit"
+    echo ""
+}
+
+search_books() {
+    local query="$1"
+    local page="${2:-1}"
+    
+    if [ -z "$query" ]; then
+        echo -n "Enter search query: "
+        read -r query
+        [ -z "$query" ] && {
+            echo "Search query cannot be empty"
+            return 1
+        }
+    fi
+    
+    echo "Searching for '$query' (page $page)..."
+
+    # RK patch 2026-08-12: LibGen-first search dispatch.
+    # SEARCH_SOURCE=auto (default): LibGen first, Anna's as fallback.
+    # SEARCH_SOURCE=lgli: LibGen only. SEARCH_SOURCE=annas: Anna's only.
+    local used_lgli=false
+    if [ "$SEARCH_SOURCE" != "annas" ]; then
+        if lgli_search_fetch "$query"; then
+            used_lgli=true
+        elif [ "$SEARCH_SOURCE" = "lgli" ]; then
+            echo "No LibGen results (mirrors unreachable or no matches)."
+            sleep 2
+            return 1
+        fi
+    fi
+
+    if [ "$used_lgli" = false ]; then
+
+    local filters=""
+    if [ -f "$SCRIPT_DIR"/tmp/current_filter_params ]; then
+        filters=$(cat "$SCRIPT_DIR/tmp/current_filter_params")
+    fi
+    
+    local encoded_query=$(echo "$query" | sed 's/ /+/g')
+    local search_url="$ANNAS_URL/search?page=${page}&q=${encoded_query}${filters}"
+    local html_content="$(curl -fsSL -A "Mozilla/5.0" "$search_url") || html_content=$(curl -fsSL -A "Mozilla/5.0" -x "$PROXY_URL" "$search_url")
+    
+    local last_page="$(echo "$html_content" | grep -o 'page=[0-9]\+"' | sort -t= -k2 -nr | head -1 | cut -d= -f2 | tr -d '"')"
+    [ -z "$last_page" ] && last_page=1
+    
+    local has_prev=false
+    [ "$page" -gt 1 ] && has_prev=true
+    
+    local has_next=false
+    [ "$page" -lt "$last_page" ] && has_next=true
+
+    echo "$query" > "$TMP_DIR"/last_search_query
+    echo "$page" > "$TMP_DIR"/last_search_page
+    echo "$last_page" > "$TMP_DIR"/last_search_last_page
+    echo "$has_next" > "$TMP_DIR"/last_search_has_next
+    echo "$has_prev" > "$TMP_DIR"/last_search_has_prev
+    
+    local books="$(printf '%s\n' "$html_content" | awk -v base_url="$ANNAS_URL" '
+        function clean(s) {
+            gsub(/<[^>]*>/, "", s)
+            gsub(/&amp;/, "\\&", s)
+            gsub(/&quot;/, "\"", s)
+            gsub(/&#39;|&apos;/, "\047", s)
+            gsub(/&nbsp;/, " ", s)
+            gsub(/&[^;]*;/, " ", s)
+            gsub(/^[ \\t\\r\\n]+|[ \\t\\r\\n]+$/, "", s)
+            gsub(/[ \\t\\r\\n][ \\t\\r\\n]+/, " ", s)
+            return s
+        }
+        function text_after(s, re,    t,q) {
+            if (match(s, re)) {
+                t = substr(s, RSTART + RLENGTH)
+                q = index(t, "</")
+                if (q) return clean(substr(t, 1, q - 1))
+            }
+            return ""
+        }
+        BEGIN {
+            RS = "href=\\\"/md5/"
+            print "["
+            count = 0
+        }
+        NR > 1 {
+            md5 = tolower(substr($0, 1, 32))
+            if (length(md5) != 32 || md5 ~ /[^0-9a-f]/) next
+
+            title = text_after($0, "<h3[^>]*>")
+            author = ""
+            if (match($0, /<div[^>]*italic[^>]*>/)) {
+                t = substr($0, RSTART + RLENGTH)
+                q = index(t, "</div>")
+                if (q) author = clean(substr(t, 1, q - 1))
+            }
+
+            meta = ""
+            if (match($0, /<div[^>]*text-gray-500[^>]*>/)) {
+                t = substr($0, RSTART + RLENGTH)
+                q = index(t, "</div>")
+                if (q) meta = clean(substr(t, 1, q - 1))
+            }
+
+            # Fallback for older Anna cards.
+            if (title == "" && match($0, /text-violet-900[^>]*data-content="[^"]+"/)) {
+                t = substr($0, RSTART, RLENGTH)
+                p = index(t, "data-content=\\\"")
+                if (p) {
+                    t = substr(t, p + 14)
+                    q = index(t, "\\\"")
+                    if (q) title = clean(substr(t, 1, q - 1))
+                }
+            }
+
+            if (author == "" && match($0, /text-amber-900[^>]*data-content="[^"]+"/)) {
+                t = substr($0, RSTART, RLENGTH)
+                p = index(t, "data-content=\\\"")
+                if (p) {
+                    t = substr(t, p + 14)
+                    q = index(t, "\\\"")
+                    if (q) author = clean(substr(t, 1, q - 1))
+                }
+            }
+
+            format = ""
+            low = tolower(meta)
+            if (low ~ /epub/) format = "epub"
+            else if (low ~ /azw3/) format = "azw3"
+            else if (low ~ /mobi/) format = "mobi"
+            else if (low ~ /pdf/) format = "pdf"
+            else if (low ~ /djvu/) format = "djvu"
+            else if (low ~ /fb2/) format = "fb2"
+            else if (low ~ /cbz/) format = "cbz"
+            else if (low ~ /cbr/) format = "cbr"
+            else if (low ~ /txt/) format = "txt"
+
+            description = meta
+            if ($0 ~ /lgli/ && description !~ /lgli/) description = description " lgli"
+            if ($0 ~ /zlib/ && description !~ /zlib/) description = description " zlib"
+
+            gsub(/\\\\/, "\\\\\\\\", title)
+            gsub(/"/, "\\\"", title)
+            gsub(/\\\\/, "\\\\\\\\", author)
+            gsub(/"/, "\\\"", author)
+            gsub(/\\\\/, "\\\\\\\\", description)
+            gsub(/"/, "\\\"", description)
+
+            if (title != "") {
+                if (count > 0) printf ",\\n"
+                printf "  {\\\"author\\\": \\\"%s\\\", \\\"format\\\": \\\"%s\\\", \\\"md5\\\": \\\"%s\\\", \\\"title\\\": \\\"%s\\\", \\\"url\\\": \\\"%s/md5/%s\\\", \\\"description\\\": \\\"%s\\\"}", author, format, md5, title, base_url, md5, description
+                count++
+            }
+        }
+        END {
+            print "\\n]"
+        }'
+    )"
+    
+    echo "$books" > "$TMP_DIR"/search_results.json
+    echo "Anna's Archive ($ANNAS_URL)" > "$TMP_DIR"/last_search_source
+
+    fi
+
+    while true; do
+        local query="$(cat "$TMP_DIR"/last_search_query 2>/dev/null)"
+        local current_page="$(cat "$TMP_DIR"/last_search_page 2>/dev/null || echo 1)"
+        local last_page="$(cat "$TMP_DIR"/last_search_last_page 2>/dev/null || echo 1)"
+        local has_next="$(cat "$TMP_DIR"/last_search_has_next 2>/dev/null || echo "false")"
+        local has_prev="$(cat "$TMP_DIR"/last_search_has_prev 2>/dev/null || echo "false")"
+        local books="$(cat "$TMP_DIR"/search_results.json 2>/dev/null)"
+        local count="$(echo "$books" | grep -o '"title":' | wc -l)"
+
+        display_books "$books" "$current_page" "$has_prev" "$has_next" "$last_page"
+        
+        echo -n "Enter choice: "
+        read -r choice
+        
+        case "$choice" in
+            [qQ])
+                return 0
+                ;;
+            [pP])
+                if [ "$has_prev" = true ]; then
+                    new_page=$((current_page - 1))
+                    echo "$new_page" > "$TMP_DIR"/last_search_page
+                    has_prev="$([ "$new_page" -gt 1 ] && echo "true" || echo "false")"
+                    has_next="$([ "$new_page" -lt "$last_page" ] && echo "true" || echo "false")"
+                    echo "$has_prev" > "$TMP_DIR"/last_search_has_prev
+                    echo "$has_next" > "$TMP_DIR"/last_search_has_next
+                    continue
+                else
+                    echo "Already on first page"
+                    sleep 2
+                fi
+                ;;
+            [nN])
+                if [ "$has_next" = true ]; then
+                    new_page=$((current_page + 1))
+                    echo "$new_page" > "$TMP_DIR"/last_search_page
+                    has_prev="$([ "$new_page" -gt 1 ] && echo "true" || echo "false")"
+                    has_next="$([ "$new_page" -lt "$last_page" ] && echo "true" || echo "false")"
+                    echo "$has_prev" > "$TMP_DIR"/last_search_has_prev
+                    echo "$has_next" > "$TMP_DIR"/last_search_has_next
+                    continue
+                else
+                    echo "Already on last page"
+                    sleep 2
+                fi
+                ;;
+            t[0-9]*)
+                page_number="${choice#t}"
+                if echo "$page_number" | grep -qE '^[0-9]+$'; then
+                    if [ "$page_number" -ge 1 ] && [ "$page_number" -le "$last_page" ]; then
+                        if [ "$page_number" -ne "$current_page" ]; then
+                            echo "$page_number" > "$TMP_DIR"/last_search_page
+                            has_prev="$([ "$page_number" -gt 1 ] && echo "true" || echo "false")"
+                            has_next="$([ "$page_number" -lt "$last_page" ] && echo "true" || echo "false")"
+                            echo "$has_prev" > "$TMP_DIR"/last_search_has_prev
+                            echo "$has_next" > "$TMP_DIR"/last_search_has_next
+                            continue
+                        else
+                            echo "You are already on page $current_page"
+                            sleep 2
+                        fi
+                    else
+                        echo "Page number out of range (1-$last_page)"
+                        sleep 2
+                    fi
+                else
+                    echo "Invalid input"
+                    sleep 2
+                fi
+                ;;
+            *)  
+                if echo "$choice" | grep -qE '^[0-9]+$'; then
+                    local start=$(( (current_page - 1) * RESULTS_PER_PAGE ))
+                    local end=$(( start + RESULTS_PER_PAGE - 1 ))
+                    [ "$end" -ge "$count" ] && end=$((count - 1))
+                    local items_on_page=$(( end - start + 1 ))
+
+                    if [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+                        absolute_index=$(( choice - 1 ))
+
+                        book_info="$(awk -v i=$absolute_index \
+                            'BEGIN{RS="\\{"; FS="\\}"} NR==i+2{print $1}' \
+                            "$TMP_DIR"/search_results.json)"
+
+                        local lgli_available=false
+                        local zlib_available=false
+
+                        if echo "$book_info" | grep -q "lgli"; then
+                            lgli_available=true
+                        fi
+                        if echo "$book_info" | grep -q "zlib"; then
+                            zlib_available=true
+                        fi
+
+                        while true; do
+                            if [ "$lgli_available" = false ] && [ "$zlib_available" = false ]; then
+                                echo "There are no available sources for this book right now."
+                            fi
+
+                            if [ "$lgli_available" = true ]; then
+                                echo "1. lgli"
+                            fi
+                            if [ "$zlib_available" = true ]; then
+                                if [ "$ZLIB_AUTH" = true ]; then
+                                    echo "2. zlib"
+                                else
+                                    echo "2. zlib (Authentication required)"
+                                fi
+                            fi
+                            echo "3. Cancel download"
+
+                            echo -n "Choose source to proceed with: "
+                            read -r source_choice
+
+                            case "$source_choice" in
+                                1)
+                                    if [ "$lgli_available" = true ]; then
+                                        echo "Proceeding with lgli..."
+                                        if ! lgli_download "$choice"; then
+                                            echo "Download from lgli failed."
+                                            sleep 2
+                                        else
+                                            break
+                                        fi
+                                    else
+                                        echo "Invalid choice."
+                                    fi
+                                    ;;
+                                2)
+                                    if [ "$zlib_available" = true ]; then
+                                        if [ "$ZLIB_AUTH" = true ]; then
+                                            echo "Proceeding with zlib..."
+                                            if ! zlib_download "$choice"; then
+                                                echo "Download from zlib failed."
+                                                sleep 2
+                                            else
+                                                break
+                                            fi
+                                        else
+                                            echo
+                                            echo -n "Do you want to sign into your zlib account? [Y/n]: "
+                                            read -r zlib_login_choice
+                                            echo
+
+                                            if [ "$zlib_login_choice" = "n" ] || [ "$zlib_login_choice" = "N" ]; then
+                                                ZLIB_AUTH=false
+                                                save_config
+                                            else
+                                                while true; do
+                                                    echo -n "Zlib email: "
+                                                    read -r zlib_email
+                                                    echo -n "Zlib password: "
+                                                    read -r zlib_password
+                                                    echo
+
+                                                    if zlib_login "$zlib_email" "$zlib_password"; then
+                                                        ZLIB_AUTH=true
+                                                        save_config
+
+                                                        printf "\n\nProceeding with zlib..."
+                                                        if ! zlib_download "$choice"; then
+                                                            echo "Download from zlib failed."
+                                                            sleep 2
+                                                        else
+                                                            break 2
+                                                        fi
+                                                    else
+                                                        echo -n "Zlib login failed. Do you want to try again? [Y/n]: "
+                                                        read -r zlib_login_retry_choice
+                                                        echo
+                                                        
+                                                        if [ "$zlib_login_retry_choice" = "n" ] || [ "$zlib_login_retry_choice" = "N" ]; then
+                                                            ZLIB_AUTH=false
+                                                            save_config
+                                                            break
+                                                        fi
+                                                    fi
+                                                done
+                                            fi
+                                        fi
+                                    else
+                                        echo "Invalid choice."
+                                    fi
+                                    ;;
+                                3)
+                                    break
+                                    ;;
+                                *)
+                                    echo "Invalid choice."
+                                    ;;
+                            esac
+                        done
+
+                        printf "\nPress any key to continue..."
+                        read -n 1 -s
+                    else
+                        echo "Invalid selection (must be between 1 and $items_on_page)"
+                        sleep 2
+                    fi
+                else
+                    echo "Invalid input"
+                    sleep 2
+                fi
+                ;;
+        esac
+    done
+}
