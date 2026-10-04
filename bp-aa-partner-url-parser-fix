@@ -13,29 +13,30 @@ p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
 s = p.read_text()
 
 start = s.find("def _slow_page_info(page: str)")
-end = s.find("\n\n", start)
 if start < 0:
     raise SystemExit("ERROR: _slow_page_info not found")
-# include full function body through its return block by finding next top-level def
-nextdef = s.find("\ndef ", start + 5)
-if nextdef < 0:
-    raise SystemExit("ERROR: next function after _slow_page_info not found")
+
+# _slow_page_info is currently the final top-level helper before
+# "annas = Annas()", so do not assume another "def" follows it.
+end = s.find("\n\nannas = Annas()", start)
+if end < 0:
+    end = s.find("\nannas = Annas()", start)
+if end < 0:
+    raise SystemExit("ERROR: end of _slow_page_info not found")
 
 new = r'''def _slow_page_info(page: str) -> tuple[str | None, int | None]:
-    """Return (direct_partner_url, wait_seconds) from an Anna slow page.
-
-    Current Anna pages can expose partner URLs as d3, d4, etc. and may render
-    the URL both as an href and as plain copyable text.  Parse either form.
-    """
+    """Return (direct_partner_url, wait_seconds) from an Anna slow page."""
     text = html.unescape(page)
 
-    # First prefer an actual href.
-    m = re.search(r'href=["\'](https?://[^"\']+/d[0-9]+/[^"\']+)["\']',
-                  text, re.I)
+    # Anna currently serves partner links as /d4/ but this also accepts
+    # future /d3/, /d5/, etc. Prefer href, then fall back to visible text.
+    m = re.search(
+        r'''href=["'](https?://[^"']+/d[0-9]+/[^"']+)["']''',
+        text, re.I)
     if not m:
-        # The copy widget can leave the signed partner URL as plain text.
-        m = re.search(r'(https?://[^\s<>"\']+/d[0-9]+/[^\s<>"\']+)',
-                      text, re.I)
+        m = re.search(
+            r'''(https?://[^\s<>"']+/d[0-9]+/[^\s<>"']+)''',
+            text, re.I)
 
     w = re.search(r'waitSeconds\s*=\s*(\d+)', text)
     return (m.group(1) if m else None,
@@ -45,7 +46,8 @@ new = r'''def _slow_page_info(page: str) -> tuple[str | None, int | None]:
 bak = p.with_suffix(".py.bak-partner-url-parser")
 if not bak.exists():
     bak.write_text(s)
-p.write_text(s[:start] + new + s[nextdef:])
+
+p.write_text(s[:start] + new + s[end:])
 print("PARSER_PATCH_OK")
 PY
 
