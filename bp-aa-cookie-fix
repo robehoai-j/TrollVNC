@@ -1,0 +1,181 @@
+#!/bin/sh
+set -eu
+
+ROOT="${HOME}/projects/bookplate"
+[ -d "$ROOT/app" ] || { echo "ERROR: $ROOT not found"; exit 1; }
+cd "$ROOT"
+
+python3 - <<'PY'
+from pathlib import Path
+import re, subprocess, sys
+
+root = Path.home() / "projects" / "bookplate"
+clip = subprocess.check_output(["pbpaste"], text=True)
+
+def grab(patterns):
+    for pat in patterns:
+        m = re.search(pat, clip, re.I | re.S)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+cookie = grab([
+    r"(?:^|\s)-b\s+'([^']*)'",
+    r"(?:^|\s)--cookie\s+'([^']*)'",
+    r"(?:^|\s)-H\s+'cookie:\s*([^']*)'",
+    r'(?:^|\s)-H\s+"cookie:\s*([^"]*)"',
+])
+ua = grab([
+    r"(?:^|\s)-H\s+'user-agent:\s*([^']*)'",
+    r'(?:^|\s)-H\s+"user-agent:\s*([^"]*)"',
+])
+
+if not cookie:
+    sys.exit("ERROR: clipboard has no Cookie header. Copy the successful &check=1 request as cURL first.")
+if "aa_account_id2=" not in cookie:
+    sys.exit("ERROR: aa_account_id2 is missing. Log in to Anna in Chrome, then copy the successful &check=1 request as cURL.")
+
+data = root / "data"
+data.mkdir(exist_ok=True)
+cp = data / "annas_browser_cookie.txt"
+cp.write_text(cookie + "\n")
+cp.chmod(0o600)
+if ua:
+    up = data / "annas_browser_ua.txt"
+    up.write_text(ua + "\n")
+    up.chmod(0o600)
+
+p = root / "app" / "annas_client.py"
+s = p.read_text()
+bak = p.with_suffix(".py.bak-browser-cookie")
+if not bak.exists():
+    bak.write_text(s)
+
+if "def _browser_cookie()" not in s:
+    s = s.replace("from . import metadata, settings", "from . import db, metadata, settings")
+
+    marker = "def _guard_hint(base: str) -> str:\n    return (f\"Anna's Archive bot check (DDoS-Guard): open {base} in a browser on this \"\n            \"server's network and complete the check once — after that, search and \"\n            \"downloads work (members' fast downloads work even without this)\")\n"
+    helper = marker + '''
+
+def _browser_cookie() -> str:
+    try:
+        return (db.DATA_DIR / "annas_browser_cookie.txt").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _browser_user_agent() -> str:
+    try:
+        return (db.DATA_DIR / "annas_browser_ua.txt").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _request_headers(cookie: str = "") -> dict:
+    headers = {**HEADERS}
+    ua = _browser_user_agent()
+    if ua:
+        headers["User-Agent"] = ua
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+'''
+    if marker not in s:
+        sys.exit("ERROR: upstream annas_client.py changed; helper insertion point not found")
+    s = s.replace(marker, helper, 1)
+
+    old = '''    async def _login(self) -> None:
+        """POST the secret key to /account/ — an aa_* session cookie comes back.
+        A bad key returns the login form with no cookie."""
+        try:
+'''
+    new = '''    async def _login(self) -> None:
+        """Use a browser-cleared Anna session when available; otherwise POST the key."""
+        browser_cookie = _browser_cookie()
+        if browser_cookie:
+            if "aa_account_id2=" not in browser_cookie:
+                raise AnnasConfigError(
+                    "Anna browser cookie is missing aa_account_id2; refresh the saved Chrome session")
+            self._cookie, self._cookie_at = browser_cookie, time.monotonic()
+            return
+        try:
+'''
+    if old not in s:
+        sys.exit("ERROR: upstream _login block changed")
+    s = s.replace(old, new, 1)
+
+    old = '''                    headers = {**HEADERS}
+                    if httpx.URL(cur).host == base_host:
+                        headers["Cookie"] = self._cookie
+'''
+    new = '''                    headers = _request_headers(
+                        self._cookie if httpx.URL(cur).host == base_host else "")
+'''
+    if old not in s:
+        sys.exit("ERROR: upstream request-header block changed")
+    s = s.replace(old, new, 1)
+
+    old = '''                if _is_challenge(r):
+                    raise _Challenge()
+                if 300 <= r.status_code < 400 and r.headers.get("location"):
+                    nxt = urljoin(cur, r.headers["location"])
+                    if httpx.URL(nxt).host != base_host:
+                        # same threat model as webfetch: a compromised mirror must
+                        # not point the server at arbitrary hosts (the cookie is
+                        # withheld, but the GET itself still leaks intent)
+                        raise AnnasUnavailable(
+                            "Anna's Archive redirected off-mirror "
+                            f"({httpx.URL(nxt).host}) — refusing to follow")
+                    if (hop := hop + 1) > MAX_HOPS:
+                        raise AnnasUnavailable("too many redirects from Anna's Archive")
+                    cur = nxt
+                    continue
+                return r
+'''
+    new = '''                # A cleared browser session legitimately gets a same-host
+                # 302 to ?check=1 before the real 200 search page. Follow it first;
+                # a 403/challenge after that is still treated as a bot check.
+                if 300 <= r.status_code < 400 and r.headers.get("location"):
+                    nxt = urljoin(cur, r.headers["location"])
+                    if httpx.URL(nxt).host != base_host:
+                        raise AnnasUnavailable(
+                            "Anna's Archive redirected off-mirror "
+                            f"({httpx.URL(nxt).host}) — refusing to follow")
+                    if (hop := hop + 1) > MAX_HOPS:
+                        raise AnnasUnavailable("too many redirects from Anna's Archive")
+                    cur = nxt
+                    continue
+                if _is_challenge(r):
+                    raise _Challenge()
+                return r
+'''
+    if old not in s:
+        sys.exit("ERROR: upstream redirect/challenge block changed")
+    s = s.replace(old, new, 1)
+
+    old = '''                r = await cx.get(f"{self._base()}/dyn/api/fast_download.json",
+                                 params={"md5": md5, "key": self._key()}, headers=HEADERS)
+'''
+    new = '''                r = await cx.get(
+                    f"{self._base()}/dyn/api/fast_download.json",
+                    params={"md5": md5, "key": self._key()},
+                    headers=_request_headers(_browser_cookie() or self._cookie))
+'''
+    if old not in s:
+        sys.exit("ERROR: upstream fast-download block changed")
+    s = s.replace(old, new, 1)
+
+    p.write_text(s)
+
+print("COOKIE_OK")
+print("PATCH_OK")
+PY
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
