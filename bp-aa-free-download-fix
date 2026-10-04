@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+python3 - <<'PY'
+from pathlib import Path
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+old = '''        if r.status_code == 429:
+            raise AnnasUnavailable("Anna's Archive rate-limited the API (429)")
+        if _is_challenge(r):
+            raise AnnasUnavailable(_guard_hint(self._base()))
+        if r.status_code != 200:  # includes the documented 204: no body to parse
+'''
+
+new = '''        if r.status_code == 429:
+            raise AnnasUnavailable("Anna's Archive rate-limited the API (429)")
+        if _is_challenge(r):
+            # Free accounts can be challenged on the member fast API even when
+            # the browser-cleared session works for normal Anna pages. Skip the
+            # member API and use Anna's free slow partner flow instead.
+            return await self._slow_download(md5, on_progress, expected_size)
+        if r.status_code != 200:  # includes the documented 204: no body to parse
+'''
+
+if new in s:
+    print("PATCH_ALREADY_PRESENT")
+elif old in s:
+    bak = p.with_suffix(".py.bak-free-slow")
+    if not bak.exists():
+        bak.write_text(s)
+    p.write_text(s.replace(old, new, 1))
+    print("PATCH_OK")
+else:
+    raise SystemExit("ERROR: expected fast-download block not found")
+
+PY
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
