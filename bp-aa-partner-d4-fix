@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+olds = [
+    r'_D3_URL_RE = re.compile(r\'href="(https?://[^"]+/d3/[^"]+)"\')',
+]
+# Work with the literal line actually present, without depending on quote escaping.
+old = '_D3_URL_RE = re.compile(r\'href="(https?://[^"]+/d3/[^"]+)"\')'
+new = '_D3_URL_RE = re.compile(r\'href="(https?://[^"]+/d[0-9]+/[^"]+)"\')'
+
+if new in s:
+    print("REGEX_ALREADY_PATCHED")
+elif old in s:
+    bak = p.with_suffix(".py.bak-partner-d4")
+    if not bak.exists():
+        bak.write_text(s)
+    s = s.replace(old, new, 1)
+    print("REGEX_PATCHED_D3_TO_DN")
+else:
+    # Fallback for formatting drift.
+    target = '/d3/[^"]+'
+    if target not in s:
+        raise SystemExit("ERROR: partner download regex not found")
+    bak = p.with_suffix(".py.bak-partner-d4")
+    if not bak.exists():
+        bak.write_text(s)
+    s = s.replace(target, '/d[0-9]+/[^"]+', 1)
+    print("REGEX_PATCHED_D3_TO_DN")
+
+s = s.replace(
+    'From a /slow_download/ page: (direct d3-link, wait_seconds).',
+    'From a /slow_download/ page: (direct partner link, wait_seconds).')
+p.write_text(s)
+print("PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
