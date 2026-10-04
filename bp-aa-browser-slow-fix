@@ -1,0 +1,175 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+PIP="$ROOT/.venv/bin/pip"
+
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+[ -x "$PY" ] || { echo "ERROR: $PY not found"; exit 1; }
+
+"$PIP" -q install playwright
+echo "PLAYWRIGHT_OK"
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+# db is already imported by the browser-cookie patch; ensure it exists.
+if "from . import db, metadata, settings" not in s:
+    s = s.replace("from . import metadata, settings",
+                  "from . import db, metadata, settings")
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: slow-download function not found")
+
+new = r'''    async def _slow_download(self, md5: str, on_progress,
+                             expected_size: int | None) -> tuple[bytes, dict]:
+        """Free Anna download through a real Chrome browser.
+
+        Anna explicitly browser-verifies slow downloads.  Plain httpx/curl can
+        search with a copied session, but the /slow_download route can still
+        self-redirect before the Flask handler.  Use a persistent visible Chrome
+        profile for that route; the user completes a browser check when Anna
+        asks for it, and subsequent downloads reuse the verified profile.
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as e:
+            raise AnnasUnavailable(
+                "Playwright is not installed for Anna browser verification") from e
+
+        base = self._base()
+        profile = db.DATA_DIR / "anna-chrome-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+
+        async def info(page, url: str, verify_seconds: int = 120):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            deadline = time.monotonic() + verify_seconds
+            while True:
+                body = await page.content()
+                direct, wait_s = _slow_page_info(body)
+                if direct or wait_s is not None:
+                    return direct, wait_s, body
+
+                low = body.lower()
+                if ("slow downloads are only available through the official website" in low
+                        or "slow downloads are not available through cloudflare" in low):
+                    return None, None, body
+
+                # DDoS-Guard/Turnstile pages need a real user gesture.  The
+                # visible Chrome window is intentionally left interactive.
+                if time.monotonic() >= deadline:
+                    return None, None, body
+                await asyncio.sleep(1)
+
+        try:
+            async with async_playwright() as pw:
+                context = await pw.chromium.launch_persistent_context(
+                    str(profile),
+                    channel="chrome",
+                    headless=False,
+                    no_viewport=True,
+                )
+                try:
+                    page = context.pages[0] if context.pages else await context.new_page()
+
+                    # Load the book page in real Chrome.  If Anna asks for a
+                    # browser check, the user can complete it in this window.
+                    await page.goto(f"{base}/md5/{md5}",
+                                    wait_until="domcontentloaded",
+                                    timeout=60000)
+
+                    candidates = []
+                    deadline = time.monotonic() + 120
+                    while not candidates:
+                        body = await page.content()
+                        href_re = re.compile(
+                            r'href="([^"]*/slow_download/' + re.escape(md5)
+                            + r'/\d+/\d+(?:\?[^"]*)?)"')
+                        for href in href_re.findall(body):
+                            href = html.unescape(href)
+                            u = urljoin(base + "/", href)
+                            if u not in candidates:
+                                candidates.append(u)
+                        if candidates:
+                            break
+                        if time.monotonic() >= deadline:
+                            raise AnnasUnavailable(
+                                "Anna browser verification did not finish; "
+                                "complete the check in the opened Chrome window")
+                        await asyncio.sleep(1)
+
+                    # Later-listed servers are commonly the no-waitlist options,
+                    # so try them first.  One verified browser context is reused
+                    # for every candidate.
+                    waits = []
+                    for u in reversed(candidates):
+                        direct, wait_s, _ = await info(page, u)
+                        if direct:
+                            return await self._fetch_file(
+                                direct, on_progress, expected_size, md5)
+                        if wait_s is not None and 0 <= wait_s <= SLOW_MAX_WAIT_S:
+                            waits.append((wait_s, u))
+
+                    if not waits:
+                        raise AnnasUnavailable(
+                            "Anna slow-download browser opened, but no server "
+                            "offered a link or countdown")
+
+                    # Stay on the shortest waitlist in the real browser. Anna's
+                    # own JavaScript reloads the page when the countdown ends.
+                    _, chosen = min(waits, key=lambda x: x[0])
+                    await page.goto(chosen, wait_until="domcontentloaded",
+                                    timeout=60000)
+                    end_wait = time.monotonic() + SLOW_MAX_WAIT_S + 180
+                    while time.monotonic() < end_wait:
+                        body = await page.content()
+                        direct, wait_s = _slow_page_info(body)
+                        if direct:
+                            return await self._fetch_file(
+                                direct, on_progress, expected_size, md5)
+                        if on_progress:
+                            on_progress(0, expected_size)
+                        await asyncio.sleep(2)
+
+                    raise AnnasUnavailable(
+                        "Anna slow-download browser wait timed out")
+                finally:
+                    await context.close()
+        except AnnasUnavailable:
+            raise
+        except Exception as e:
+            raise AnnasUnavailable(
+                f"Anna Chrome browser flow failed: {e}") from e
+
+'''
+
+bak = p.with_suffix(".py.bak-playwright-slow")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[end:])
+print("PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
