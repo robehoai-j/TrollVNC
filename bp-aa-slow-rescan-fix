@@ -1,0 +1,134 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: slow-download function not found")
+
+new = r'''    async def _slow_download(self, md5: str, on_progress,
+                             expected_size: int | None) -> tuple[bytes, dict]:
+        """Free slow download using live links from the MD5 page.
+
+        Anna's waitlist pages are time-windowed. A server can move between
+        countdown, ready, and a neutral/unusable page while we are probing other
+        servers. Re-scan every advertised candidate after each wait and skip
+        neutral pages instead of failing the whole job on one server.
+        """
+        base = self._base()
+
+        page = await _browser_page(f"{base}/md5/{md5}", base)
+        if page.status_code != 200:
+            raise AnnasUnavailable(
+                f"Anna's Archive book page HTTP {page.status_code}")
+
+        href_re = re.compile(
+            r'href="([^"]*/slow_download/' + re.escape(md5)
+            + r'/\d+/\d+(?:\?[^"]*)?)"')
+        candidates = []
+        for href in href_re.findall(page.text):
+            href = html.unescape(href)
+            u = urljoin(base + "/", href)
+            if u not in candidates:
+                candidates.append(u)
+
+        if not candidates:
+            raise AnnasUnavailable(
+                "Anna's Archive book page exposed no slow-download links")
+
+        deadline = time.monotonic() + (2 * SLOW_MAX_WAIT_S + 120)
+        neutral_rounds = 0
+
+        while True:
+            waits = []
+            neutral = 0
+            last_status = ""
+
+            # Scan all currently advertised servers. This is intentionally a
+            # full re-scan: a server that was waitlisted a moment ago may now
+            # be inside its ready window.
+            for u in candidates:
+                r = await _browser_page(u, base)
+                if r.status_code != 200:
+                    last_status = f"HTTP {r.status_code}"
+                    neutral += 1
+                    continue
+
+                url, wait_s = _slow_page_info(r.text)
+                if url:
+                    return await self._fetch_file(
+                        url, on_progress, expected_size, md5)
+
+                if wait_s is not None and 0 <= wait_s <= SLOW_MAX_WAIT_S:
+                    waits.append(wait_s)
+                    continue
+
+                neutral += 1
+
+            if waits:
+                neutral_rounds = 0
+                wait_s = min(waits)
+                # Wake just inside the next ready window, then re-scan every
+                # server rather than assuming the same URL is still usable.
+                remaining = wait_s + 2
+                if time.monotonic() + remaining > deadline:
+                    raise AnnasUnavailable(
+                        f"Anna's Archive waitlist kept reopening (last {wait_s}s)")
+
+                waited = 0
+                while waited < remaining:
+                    chunk = min(SLOW_POLL_S, remaining - waited)
+                    await asyncio.sleep(chunk)
+                    waited += chunk
+                    if on_progress:
+                        on_progress(0, expected_size)
+                continue
+
+            # No countdown and no direct link on any server. This can happen
+            # transiently at a window boundary; retry a few short rounds before
+            # declaring the set unusable.
+            neutral_rounds += 1
+            if neutral_rounds >= 4 or time.monotonic() + 5 > deadline:
+                detail = f"; last {last_status}" if last_status else ""
+                raise AnnasUnavailable(
+                    f"Anna's Archive slow servers offered neither links nor countdowns{detail}")
+
+            await asyncio.sleep(5)
+            if on_progress:
+                on_progress(0, expected_size)
+
+'''
+
+bak = p.with_suffix(".py.bak-slow-rescan")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[end:])
+print("PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
