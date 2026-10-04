@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("def _slow_page_info(page: str)")
+end = s.find("\n\n", start)
+if start < 0:
+    raise SystemExit("ERROR: _slow_page_info not found")
+# include full function body through its return block by finding next top-level def
+nextdef = s.find("\ndef ", start + 5)
+if nextdef < 0:
+    raise SystemExit("ERROR: next function after _slow_page_info not found")
+
+new = r'''def _slow_page_info(page: str) -> tuple[str | None, int | None]:
+    """Return (direct_partner_url, wait_seconds) from an Anna slow page.
+
+    Current Anna pages can expose partner URLs as d3, d4, etc. and may render
+    the URL both as an href and as plain copyable text.  Parse either form.
+    """
+    text = html.unescape(page)
+
+    # First prefer an actual href.
+    m = re.search(r'href=["\'](https?://[^"\']+/d[0-9]+/[^"\']+)["\']',
+                  text, re.I)
+    if not m:
+        # The copy widget can leave the signed partner URL as plain text.
+        m = re.search(r'(https?://[^\s<>"\']+/d[0-9]+/[^\s<>"\']+)',
+                      text, re.I)
+
+    w = re.search(r'waitSeconds\s*=\s*(\d+)', text)
+    return (m.group(1) if m else None,
+            int(w.group(1)) if w else None)
+'''
+
+bak = p.with_suffix(".py.bak-partner-url-parser")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[nextdef:])
+print("PARSER_PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
