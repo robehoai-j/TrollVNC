@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+DB="$ROOT/data/ebook.db"
+[ -d "$ROOT/app" ] || { echo "ERROR: $ROOT not found"; exit 1; }
+
+python3 - <<'PY'
+from pathlib import Path
+import re, subprocess, sys
+
+root = Path.home() / "projects" / "bookplate"
+clip = subprocess.check_output(["pbpaste"], text=True)
+
+def grab(patterns):
+    for pat in patterns:
+        m = re.search(pat, clip, re.I | re.S)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+cookie = grab([
+    r"(?:^|\s)-b\s+'([^']*)'",
+    r"(?:^|\s)--cookie\s+'([^']*)'",
+    r"(?:^|\s)-H\s+'cookie:\s*([^']*)'",
+    r'(?:^|\s)-H\s+"cookie:\s*([^"]*)"',
+])
+ua = grab([
+    r"(?:^|\s)-H\s+'user-agent:\s*([^']*)'",
+    r'(?:^|\s)-H\s+"user-agent:\s*([^"]*)"',
+])
+
+if not cookie:
+    sys.exit("ERROR: clipboard has no Cookie header")
+if "aa_account_id2=" not in cookie:
+    sys.exit("ERROR: aa_account_id2 missing; log in to Anna first")
+
+data = root / "data"
+data.mkdir(exist_ok=True)
+(data / "annas_browser_cookie.txt").write_text(cookie + "\n")
+(data / "annas_browser_cookie.txt").chmod(0o600)
+if ua:
+    (data / "annas_browser_ua.txt").write_text(ua + "\n")
+    (data / "annas_browser_ua.txt").chmod(0o600)
+
+print("COOKIE_REFRESHED")
+PY
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
