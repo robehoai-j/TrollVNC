@@ -1,0 +1,107 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+old = r'''        # Use the shortest current waitlist.
+        wait_s, u = min(waits, key=lambda x: x[0])
+        remaining = wait_s + 2
+        waited = 0
+        while waited < remaining:
+            chunk = min(SLOW_POLL_S, remaining - waited)
+            await asyncio.sleep(chunk)
+            waited += chunk
+            if on_progress:
+                on_progress(0, expected_size)
+
+        r = await _browser_page(u, base)
+        if r.status_code != 200:
+            raise AnnasUnavailable(
+                f"Anna's Archive slow download HTTP {r.status_code} after wait")
+        url, wait_again = _slow_page_info(r.text)
+        if url:
+            return await self._fetch_file(
+                url, on_progress, expected_size, md5)
+        if wait_again is not None:
+            raise AnnasUnavailable(
+                f"Anna's Archive waitlist reopened ({wait_again}s)")
+        raise AnnasUnavailable(
+            "Anna's Archive waitlist finished but no download link appeared")
+'''
+
+new = r'''        # Use the shortest current waitlist, but refresh it before sleeping:
+        # probing all advertised servers can make the original countdown stale.
+        _, u = min(waits, key=lambda x: x[0])
+        deadline = time.monotonic() + (2 * SLOW_MAX_WAIT_S + 120)
+
+        while True:
+            r = await _browser_page(u, base)
+            if r.status_code != 200:
+                raise AnnasUnavailable(
+                    f"Anna's Archive slow download HTTP {r.status_code}")
+
+            url, wait_s = _slow_page_info(r.text)
+            if url:
+                return await self._fetch_file(
+                    url, on_progress, expected_size, md5)
+
+            if wait_s is None:
+                raise AnnasUnavailable(
+                    "Anna's Archive slow server returned neither a link nor a countdown")
+            if wait_s < 0 or wait_s > SLOW_MAX_WAIT_S:
+                raise AnnasUnavailable(
+                    f"Anna's Archive invalid waitlist value ({wait_s}s)")
+
+            # Anna exposes a short ready window in a repeating waitlist cycle.
+            # If the window was missed, the page legitimately opens a new
+            # countdown. Keep following it instead of treating that as failure.
+            remaining = wait_s + 2
+            if time.monotonic() + remaining > deadline:
+                raise AnnasUnavailable(
+                    f"Anna's Archive waitlist kept reopening (last {wait_s}s)")
+
+            waited = 0
+            while waited < remaining:
+                chunk = min(SLOW_POLL_S, remaining - waited)
+                await asyncio.sleep(chunk)
+                waited += chunk
+                if on_progress:
+                    on_progress(0, expected_size)
+'''
+
+if new in s:
+    print("PATCH_ALREADY_PRESENT")
+elif old in s:
+    bak = p.with_suffix(".py.bak-waitlist-loop")
+    if not bak.exists():
+        bak.write_text(s)
+    p.write_text(s.replace(old, new, 1))
+    print("PATCH_OK")
+else:
+    raise SystemExit("ERROR: expected waitlist block not found")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
