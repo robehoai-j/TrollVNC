@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || { echo "ERROR: Bookplate venv not found"; exit 1; }
+
+cd "$ROOT"
+
+"$PY" - <<'PY'
+import asyncio, sqlite3, time
+from pathlib import Path
+from playwright.async_api import async_playwright
+
+root = Path.home() / "projects" / "bookplate"
+data = root / "data"
+profile = data / "anna-chrome-profile"
+dbp = data / "ebook.db"
+
+con = sqlite3.connect(dbp)
+row = con.execute("SELECT value FROM settings WHERE key='annas.base_url'").fetchone()
+base = ((row[0] if row else "") or "https://annas-archive.gd").rstrip("/")
+con.close()
+
+async def stable_content(page):
+    for _ in range(80):
+        try:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=1500)
+            except Exception:
+                pass
+            return await page.content()
+        except Exception as e:
+            msg = str(e).lower()
+            if ("navigating" not in msg and "changing the content" not in msg
+                    and "execution context" not in msg and "destroyed" not in msg):
+                raise
+            await asyncio.sleep(0.25)
+    return ""
+
+async def main():
+    profile.mkdir(parents=True, exist_ok=True)
+    async with async_playwright() as pw:
+        context = await pw.chromium.launch_persistent_context(
+            str(profile), channel="chrome", headless=False, no_viewport=True
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            print("CHROME_OPENED")
+            print("If Anna shows a bot check or login page, complete it in this Chrome window.")
+
+            await page.goto(base + "/search?q=harry+potter",
+                            wait_until="domcontentloaded", timeout=60000)
+
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                body = await stable_content(page)
+                cookies = await context.cookies()
+                by_name = {}
+                for c in cookies:
+                    if "annas-archive" in (c.get("domain") or ""):
+                        by_name[c["name"]] = c["value"]
+
+                if "aa_account_id2" in by_name and "/md5/" in body:
+                    cookie_header = "; ".join(
+                        f"{k}={v}" for k, v in by_name.items()
+                    )
+                    ua = await page.evaluate("navigator.userAgent")
+
+                    cp = data / "annas_browser_cookie.txt"
+                    cp.write_text(cookie_header + "\n")
+                    cp.chmod(0o600)
+
+                    up = data / "annas_browser_ua.txt"
+                    up.write_text(ua + "\n")
+                    up.chmod(0o600)
+
+                    print("COOKIE_REFRESHED")
+                    return
+
+                await asyncio.sleep(1)
+
+            raise RuntimeError(
+                "Timed out: finish Anna bot check/login in the opened Chrome window, then run again."
+            )
+        finally:
+            await context.close()
+
+asyncio.run(main())
+PY
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
