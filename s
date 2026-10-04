@@ -103,7 +103,9 @@ search_books() {
     
     local encoded_query=$(echo "$query" | sed 's/ /+/g')
     local search_url="$ANNAS_URL/search?page=${page}&q=${encoded_query}${filters}"
-    local html_content="$(curl -fsSL -A "Mozilla/5.0" "$search_url") || html_content=$(curl -fsSL -A "Mozilla/5.0" -x "$PROXY_URL" "$search_url")
+    local html_content
+    html_content="$(curl -fsSL -A "Mozilla/5.0" "$search_url")" || \
+        html_content="$(curl -fsSL -A "Mozilla/5.0" -x "$PROXY_URL" "$search_url")"
     
     local last_page="$(echo "$html_content" | grep -o 'page=[0-9]\+"' | sort -t= -k2 -nr | head -1 | cut -d= -f2 | tr -d '"')"
     [ -z "$last_page" ] && last_page=1
@@ -167,20 +169,20 @@ search_books() {
             # Fallback for older Anna cards.
             if (title == "" && match($0, /text-violet-900[^>]*data-content="[^"]+"/)) {
                 t = substr($0, RSTART, RLENGTH)
-                p = index(t, "data-content=\\\"")
+                p = index(t, "data-content=\"")
                 if (p) {
                     t = substr(t, p + 14)
-                    q = index(t, "\\\"")
+                    q = index(t, "\"")
                     if (q) title = clean(substr(t, 1, q - 1))
                 }
             }
 
             if (author == "" && match($0, /text-amber-900[^>]*data-content="[^"]+"/)) {
                 t = substr($0, RSTART, RLENGTH)
-                p = index(t, "data-content=\\\"")
+                p = index(t, "data-content=\"")
                 if (p) {
                     t = substr(t, p + 14)
-                    q = index(t, "\\\"")
+                    q = index(t, "\"")
                     if (q) author = clean(substr(t, 1, q - 1))
                 }
             }
