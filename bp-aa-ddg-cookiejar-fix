@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$ROOT/.venv/bin/python" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _fetch_authed(self, url: str) -> httpx.Response:")
+end = s.find("    async def search_page(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: _fetch_authed block not found")
+
+new = r'''    async def _fetch_authed(self, url: str) -> httpx.Response:
+        """GET with Anna/browser session and persist DDoS-Guard cookie rotations.
+
+        DDoS-Guard can rotate __ddg* cookies on the initial 302 -> ?check=1 hop.
+        Reusing only the original Chrome Cookie header makes search work but later
+        /md5/ and /slow_download/ requests fail. Keep one httpx cookie jar across
+        each redirect chain and save its updated cookies for the next AA request.
+        """
+        if not self._cookie or time.monotonic() - self._cookie_at > SESSION_TTL_S:
+            await self._login()
+
+        base_host = httpx.URL(self._base()).host
+
+        def seed(cx: httpx.AsyncClient) -> None:
+            for part in self._cookie.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name:
+                    cx.cookies.set(name, value, domain=base_host, path="/")
+
+        def save(cx: httpx.AsyncClient) -> None:
+            vals = []
+            seen_names = set()
+            # Prefer the newest value for duplicate cookie names.
+            for c in reversed(list(cx.cookies.jar)):
+                if c.name in seen_names:
+                    continue
+                if c.domain and base_host not in c.domain.lstrip("."):
+                    continue
+                seen_names.add(c.name)
+                vals.append((c.name, c.value))
+            vals.reverse()
+            if vals:
+                self._cookie = "; ".join(f"{k}={v}" for k, v in vals)
+                self._cookie_at = time.monotonic()
+
+        async def once() -> httpx.Response:
+            hop, cur = 0, url
+            seen_urls = set()
+            async with httpx.AsyncClient(
+                    timeout=30, follow_redirects=False,
+                    headers=_request_headers()) as cx:
+                seed(cx)
+                while True:
+                    if cur in seen_urls:
+                        save(cx)
+                        raise _Challenge()
+                    seen_urls.add(cur)
+                    try:
+                        r = await cx.get(cur)
+                    except httpx.HTTPError as e:
+                        raise AnnasUnavailable(
+                            f"Anna's Archive unreachable: {e}") from e
+
+                    # Set-Cookie on the 302/check page is part of the guard state.
+                    save(cx)
+
+                    if 300 <= r.status_code < 400 and r.headers.get("location"):
+                        nxt = urljoin(cur, r.headers["location"])
+                        if httpx.URL(nxt).host != base_host:
+                            raise AnnasUnavailable(
+                                "Anna's Archive redirected off-mirror "
+                                f"({httpx.URL(nxt).host}) — refusing to follow")
+                        if (hop := hop + 1) > MAX_HOPS:
+                            raise AnnasUnavailable(
+                                "too many redirects from Anna's Archive")
+                        cur = nxt
+                        continue
+
+                    if _is_challenge(r):
+                        raise _Challenge()
+                    return r
+
+        try:
+            return await once()
+        except _Challenge:
+            # Browser-cookie mode cannot manufacture a fresh challenge solution,
+            # but retry once with the latest persisted guard cookies.
+            try:
+                return await once()
+            except _Challenge:
+                raise AnnasUnavailable(_guard_hint(self._base()))
+
+'''
+
+bak = p.with_suffix(".py.bak-ddg-cookiejar")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[end:])
+print("PATCH_OK")
+PY
+
+# Retry currently queued Anna jobs immediately; do not resurrect deleted/done jobs.
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
