@@ -1,0 +1,167 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+[ -x "$PY" ] || { echo "ERROR: $PY not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+bak = p.with_suffix(".py.bak-diag-transport")
+if not bak.exists():
+    bak.write_text(s)
+
+# Add a transport that intentionally mirrors the already-successful bp-aa-diag:
+# one client, raw Chrome Cookie header, at most one same-host redirect.
+marker = "class AnnasUnavailable(Exception):\n    pass\n"
+helper = r'''class AnnasUnavailable(Exception):
+    pass
+
+
+async def _browser_page(url: str, base: str) -> httpx.Response:
+    """Fetch an Anna HTML page exactly like the successful standalone diagnostic."""
+    cookie = _browser_cookie()
+    if not cookie:
+        raise AnnasUnavailable(_guard_hint(base))
+    headers = {
+        "User-Agent": _browser_user_agent() or HEADERS["User-Agent"],
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": cookie,
+    }
+    base_host = httpx.URL(base).host
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False,
+                               headers=headers) as cx:
+        try:
+            r = await cx.get(url)
+        except httpx.HTTPError as e:
+            raise AnnasUnavailable(f"Anna's Archive unreachable: {e}") from e
+
+        if 300 <= r.status_code < 400 and r.headers.get("location"):
+            nxt = urljoin(url, r.headers["location"])
+            if httpx.URL(nxt).host != base_host:
+                raise AnnasUnavailable(
+                    f"Anna's Archive redirected off-mirror ({httpx.URL(nxt).host})")
+            try:
+                r2 = await cx.get(nxt)
+            except httpx.HTTPError as e:
+                raise AnnasUnavailable(f"Anna's Archive unreachable: {e}") from e
+            if 300 <= r2.status_code < 400 and r2.headers.get("location"):
+                raise AnnasUnavailable(
+                    f"Anna browser flow redirected twice: {nxt} -> "
+                    f"{r2.headers.get('location')}")
+            r = r2
+
+        if r.status_code == 403:
+            raise AnnasUnavailable(_guard_hint(base))
+        return r
+'''
+if "async def _browser_page(" not in s:
+    if marker not in s:
+        raise SystemExit("ERROR: helper insertion point not found")
+    s = s.replace(marker, helper, 1)
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: slow-download function not found")
+
+new = r'''    async def _slow_download(self, md5: str, on_progress,
+                             expected_size: int | None) -> tuple[bytes, dict]:
+        """Free slow download using the exact browser-cookie flow proven by diag."""
+        base = self._base()
+
+        # IMPORTANT: start from the plain /md5/ URL.  Anna's guard currently
+        # answers 302 -> ?check=1 -> 200; hitting check=1 first can loop.
+        page = await _browser_page(f"{base}/md5/{md5}", base)
+        if page.status_code != 200:
+            raise AnnasUnavailable(
+                f"Anna's Archive book page HTTP {page.status_code}")
+
+        href_re = re.compile(
+            r'href="([^"]*/slow_download/' + re.escape(md5)
+            + r'/\d+/\d+(?:\?[^"]*)?)"')
+        candidates = []
+        for href in href_re.findall(page.text):
+            href = html.unescape(href)
+            u = urljoin(base + "/", href)
+            if u not in candidates:
+                candidates.append(u)
+
+        if not candidates:
+            raise AnnasUnavailable(
+                "Anna's Archive book page exposed no slow-download links")
+
+        last = "no slow server offered a link"
+        waits = []
+
+        # Probe every live link from the MD5 page.  This matches the diagnostic
+        # that showed 16 links for the user's Harry Potter record.
+        for u in candidates:
+            r = await _browser_page(u, base)
+            if r.status_code != 200:
+                last = f"slow_download HTTP {r.status_code}"
+                continue
+            url, wait_s = _slow_page_info(r.text)
+            if url:
+                return await self._fetch_file(
+                    url, on_progress, expected_size, md5)
+            if wait_s is not None and 0 <= wait_s <= SLOW_MAX_WAIT_S:
+                waits.append((wait_s, u))
+
+        if not waits:
+            raise AnnasUnavailable(
+                f"Anna's Archive slow download: {last}")
+
+        # Use the shortest current waitlist.
+        wait_s, u = min(waits, key=lambda x: x[0])
+        remaining = wait_s + 2
+        waited = 0
+        while waited < remaining:
+            chunk = min(SLOW_POLL_S, remaining - waited)
+            await asyncio.sleep(chunk)
+            waited += chunk
+            if on_progress:
+                on_progress(0, expected_size)
+
+        r = await _browser_page(u, base)
+        if r.status_code != 200:
+            raise AnnasUnavailable(
+                f"Anna's Archive slow download HTTP {r.status_code} after wait")
+        url, wait_again = _slow_page_info(r.text)
+        if url:
+            return await self._fetch_file(
+                url, on_progress, expected_size, md5)
+        if wait_again is not None:
+            raise AnnasUnavailable(
+                f"Anna's Archive waitlist reopened ({wait_again}s)")
+        raise AnnasUnavailable(
+            "Anna's Archive waitlist finished but no download link appeared")
+
+'''
+
+s = s[:start] + new + s[end:]
+p.write_text(s)
+print("PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
