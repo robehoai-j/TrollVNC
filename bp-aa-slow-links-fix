@@ -1,0 +1,110 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: slow-download function not found")
+
+new = r'''    async def _slow_download(self, md5: str, on_progress,
+                             expected_size: int | None) -> tuple[bytes, dict]:
+        """Use the exact slow-server links advertised by the live /md5/ page.
+
+        Anna can expose multiple path_index/domain_index combinations per book;
+        hard-coding path_index=0 can miss every usable server even when the page
+        advertises working free-download links.
+        """
+        page = await self._fetch_authed(f"{self._base()}/md5/{md5}")
+        if page.status_code != 200:
+            raise AnnasUnavailable(
+                f"Anna's Archive book page HTTP {page.status_code}")
+
+        href_re = re.compile(
+            r'href="([^"]*/slow_download/' + re.escape(md5)
+            + r'/\d+/\d+(?:\?[^"]*)?)"')
+        candidates = []
+        for href in href_re.findall(page.text):
+            href = html.unescape(href)
+            u = urljoin(self._base() + "/", href)
+            if u not in candidates:
+                candidates.append(u)
+
+        # Defensive fallback for future markup changes.
+        if not candidates:
+            candidates = [
+                f"{self._base()}/slow_download/{md5}/0/{i}"
+                for i in SLOW_DOMAIN_INDICES
+            ]
+
+        last = "no slow server offered a link"
+        waits = []
+
+        # Probe every advertised server once. Prefer any immediately-ready link;
+        # otherwise remember the shortest waitlist instead of sleeping on the
+        # first server we happen to see.
+        for u in candidates:
+            r = await self._fetch_authed(u)
+            if r.status_code != 200:
+                last = f"slow_download HTTP {r.status_code}"
+                continue
+            url, wait_s = _slow_page_info(r.text)
+            if url:
+                return await self._fetch_file(
+                    url, on_progress, expected_size, md5)
+            if wait_s is not None and 0 <= wait_s <= SLOW_MAX_WAIT_S:
+                waits.append((wait_s, u))
+
+        if waits:
+            wait_s, u = min(waits, key=lambda x: x[0])
+            # Anna's own JS reloads when the countdown reaches zero. Give the
+            # server one extra second so we land inside the ready window.
+            remaining = wait_s + 1
+            waited = 0
+            while waited < remaining:
+                chunk = min(SLOW_POLL_S, remaining - waited)
+                await asyncio.sleep(chunk)
+                waited += chunk
+                if on_progress:
+                    on_progress(0, expected_size)
+
+            r = await self._fetch_authed(u)
+            if r.status_code == 200:
+                url, wait_again = _slow_page_info(r.text)
+                if url:
+                    return await self._fetch_file(
+                        url, on_progress, expected_size, md5)
+                if wait_again is not None:
+                    last = f"waitlist reopened ({wait_again}s)"
+                else:
+                    last = "waitlist finished but no download link appeared"
+            else:
+                last = f"slow_download HTTP {r.status_code}"
+
+        raise AnnasUnavailable(f"Anna's Archive slow download: {last}")
+
+'''
+
+bak = p.with_suffix(".py.bak-slow-links")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[end:])
+print("PATCH_OK")
+PY
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
