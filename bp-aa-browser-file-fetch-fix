@@ -1,0 +1,115 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: browser slow-download block not found")
+
+block = s[start:end]
+
+anchor = '''        profile = db.DATA_DIR / "anna-chrome-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+'''
+helper = anchor + '''
+        async def browser_fetch(context, url: str):
+            """Fetch the signed partner file through Chrome's own request context."""
+            try:
+                r = await context.request.get(
+                    url,
+                    timeout=1800000,
+                    max_redirects=20,
+                    fail_on_status_code=False,
+                )
+            except Exception as e:
+                raise AnnasUnavailable(
+                    f"Anna partner fetch via Chrome failed: {e}") from e
+
+            if r.status != 200:
+                raise AnnasUnavailable(
+                    f"Anna partner fetch via Chrome HTTP {r.status}")
+
+            headers = r.headers
+            try:
+                declared = int(headers.get("content-length") or 0)
+            except Exception:
+                declared = 0
+            if declared > BOOK_MAX_BYTES:
+                raise AnnasUnavailable(
+                    f"Anna partner file exceeds size cap ({declared} bytes)")
+
+            data = await r.body()
+            if not data:
+                raise AnnasUnavailable("Anna partner fetch via Chrome returned no data")
+            if len(data) > BOOK_MAX_BYTES:
+                raise AnnasUnavailable(
+                    f"Anna partner file exceeds size cap ({len(data)} bytes)")
+
+            if on_progress:
+                on_progress(len(data), declared or expected_size)
+
+            if hashlib.md5(data).hexdigest() != md5:
+                raise AnnasUnavailable(
+                    "Anna partner file failed md5 check (stale/wrong link)")
+
+            name = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+            if "~" in name or name.rsplit(".", 1)[-1].lower() not in _GOOD_FILE_EXTS:
+                name = ""
+            return data, {"_filename": name or md5}
+'''
+
+if "async def browser_fetch(context, url: str):" not in block:
+    if anchor not in block:
+        raise SystemExit("ERROR: browser profile insertion point not found")
+    block = block.replace(anchor, helper, 1)
+
+old = '''return await self._fetch_file(
+                                direct, on_progress, expected_size, md5)'''
+count = block.count(old)
+if count:
+    block = block.replace(old, 'return await browser_fetch(context, direct)')
+else:
+    # tolerate indentation/layout changes
+    old2 = "return await self._fetch_file(direct, on_progress, expected_size, md5)"
+    count = block.count(old2)
+    if count:
+        block = block.replace(old2, "return await browser_fetch(context, direct)")
+
+if count == 0 and "return await browser_fetch(context, direct)" not in block:
+    raise SystemExit("ERROR: direct partner fetch call not found")
+
+bak = p.with_suffix(".py.bak-browser-file-fetch")
+if not bak.exists():
+    bak.write_text(s)
+
+p.write_text(s[:start] + block + s[end:])
+print(f"PARTNER_FETCH_PATCH_OK replacements={count}")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
