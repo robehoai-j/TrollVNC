@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+PY="$ROOT/.venv/bin/python"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _slow_download(")
+end = s.find("    async def _fetch_file(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: browser slow-download block not found")
+
+block = s[start:end]
+
+old = '''            if r.status != 200:
+                raise AnnasUnavailable(
+                    f"Anna partner fetch via Chrome HTTP {r.status}")
+'''
+new = '''            if r.status != 200:
+                # Partner nodes are independent and some occasionally return
+                # 502/503/504.  Treat those as a dead candidate so the caller
+                # can try another slow server instead of failing the whole job.
+                if r.status in (429, 500, 502, 503, 504):
+                    return None
+                raise AnnasUnavailable(
+                    f"Anna partner fetch via Chrome HTTP {r.status}")
+'''
+if old in block:
+    block = block.replace(old, new, 1)
+elif new not in block:
+    raise SystemExit("ERROR: browser_fetch HTTP block not found")
+
+old = '''            except Exception as e:
+                raise AnnasUnavailable(
+                    f"Anna partner fetch via Chrome failed: {e}") from e
+'''
+new = '''            except Exception:
+                # Timeout/network failure on one partner should not poison the
+                # job; another advertised slow server may still work.
+                return None
+'''
+if old in block:
+    block = block.replace(old, new, 1)
+
+# Replace direct-return sites so a dead partner continues to the next candidate.
+old = '''                        if direct:
+                            return await browser_fetch(context, direct)
+'''
+new = '''                        if direct:
+                            fetched = await browser_fetch(context, direct)
+                            if fetched is not None:
+                                return fetched
+                            # Dead/transient partner; keep scanning candidates.
+                            continue
+'''
+if old in block:
+    block = block.replace(old, new, 1)
+
+old2 = '''                        if direct:
+                            return await browser_fetch(context, direct)
+'''
+# second occurrence may already have been replaced by replace(all); handle by
+# replacing all remaining identical blocks.
+block = block.replace(old2, new)
+
+# In the wait loop, a failed direct partner should rescan all candidates rather
+# than immediately failing.
+old = '''                        if direct:
+                            return await browser_fetch(context, direct)
+'''
+block = block.replace(old, new)
+
+# Add a last-resort rescan after the chosen waitlist path produces a dead direct URL.
+needle = '''                    raise AnnasUnavailable(
+                        "Anna slow-download browser wait timed out")
+'''
+replacement = '''                    raise AnnasUnavailable(
+                        "Anna slow-download browser wait timed out or all partner nodes returned transient errors")
+'''
+if needle in block:
+    block = block.replace(needle, replacement, 1)
+
+bak = p.with_suffix(".py.bak-partner-retry")
+if not bak.exists():
+    bak.write_text(s)
+
+p.write_text(s[:start] + block + s[end:])
+print("PARTNER_RETRY_PATCH_OK")
+PY
+
+"$PY" -m py_compile "$P"
+echo "PYTHON_OK"
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
