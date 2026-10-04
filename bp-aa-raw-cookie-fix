@@ -1,0 +1,98 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+P="$ROOT/app/annas_client.py"
+DB="$ROOT/data/ebook.db"
+[ -f "$P" ] || { echo "ERROR: $P not found"; exit 1; }
+
+"$ROOT/.venv/bin/python" - <<'PY'
+from pathlib import Path
+
+p = Path.home() / "projects" / "bookplate" / "app" / "annas_client.py"
+s = p.read_text()
+
+start = s.find("    async def _fetch_authed(self, url: str) -> httpx.Response:")
+end = s.find("    async def search_page(", start)
+if start < 0 or end < 0:
+    raise SystemExit("ERROR: _fetch_authed block not found")
+
+new = r'''    async def _fetch_authed(self, url: str) -> httpx.Response:
+        """GET with the browser-cleared Anna session.
+
+        Keep the exact Cookie header copied from Chrome on every hop.  This
+        intentionally mirrors the diagnostic path that succeeds on /md5/ and
+        /slow_download/: one client, manual same-host redirects, unchanged
+        browser cookies.  DDoS-Guard is sensitive enough that rewriting the
+        cookies into a synthetic cookie jar can make later routes fail even
+        while /search still works.
+        """
+        if not self._cookie or time.monotonic() - self._cookie_at > SESSION_TTL_S:
+            await self._login()
+
+        async def once() -> httpx.Response:
+            hop, cur = 0, url
+            base_host = httpx.URL(self._base()).host
+            headers = _request_headers(self._cookie)
+            async with httpx.AsyncClient(
+                    timeout=30, follow_redirects=False,
+                    headers=headers) as cx:
+                while True:
+                    try:
+                        r = await cx.get(cur)
+                    except httpx.HTTPError as e:
+                        raise AnnasUnavailable(
+                            f"Anna's Archive unreachable: {e}") from e
+
+                    if 300 <= r.status_code < 400 and r.headers.get("location"):
+                        nxt = urljoin(cur, r.headers["location"])
+                        if httpx.URL(nxt).host != base_host:
+                            raise AnnasUnavailable(
+                                "Anna's Archive redirected off-mirror "
+                                f"({httpx.URL(nxt).host}) — refusing to follow")
+                        hop += 1
+                        if hop > MAX_HOPS:
+                            raise AnnasUnavailable(
+                                "too many redirects from Anna's Archive")
+                        cur = nxt
+                        continue
+
+                    if _is_challenge(r):
+                        raise _Challenge()
+                    return r
+
+        try:
+            return await once()
+        except _Challenge:
+            # A Chrome-derived session cannot solve a fresh JS challenge itself.
+            # Keep the saved browser cookies untouched so refreshing them later
+            # remains deterministic.
+            if _browser_cookie():
+                raise AnnasUnavailable(_guard_hint(self._base()))
+            await self._login()
+            try:
+                return await once()
+            except _Challenge:
+                raise AnnasUnavailable(_guard_hint(self._base()))
+
+'''
+
+bak = p.with_suffix(".py.bak-raw-browser-cookie")
+if not bak.exists():
+    bak.write_text(s)
+p.write_text(s[:start] + new + s[end:])
+print("PATCH_OK")
+PY
+
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "UPDATE download_jobs SET next_attempt_at=NULL,error='',attempts=0 WHERE source='annas' AND status='queued';"
+  echo "QUEUE_RESET"
+fi
+
+PIDFILE="$ROOT/data/serve.pid"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")"
+  sleep 2
+fi
+nohup "$ROOT/scripts/serve.sh" >/dev/null 2>&1 &
+sleep 3
+echo "BOOKPLATE_RESTARTED"
