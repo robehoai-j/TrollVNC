@@ -1,0 +1,86 @@
+#!/bin/sh
+set -eu
+ROOT="${HOME}/projects/bookplate"
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || { echo "ERROR: Bookplate venv not found"; exit 1; }
+
+"$PY" - <<'PY'
+from pathlib import Path
+import re, sqlite3, sys
+import httpx
+
+root = Path.home() / "projects" / "bookplate"
+dbp = root / "data" / "ebook.db"
+cookiep = root / "data" / "annas_browser_cookie.txt"
+uap = root / "data" / "annas_browser_ua.txt"
+
+con = sqlite3.connect(dbp)
+con.row_factory = sqlite3.Row
+row = con.execute("""
+  SELECT zlib_id, title, error
+  FROM download_jobs
+  WHERE source='annas'
+  ORDER BY id DESC LIMIT 1
+""").fetchone()
+if not row:
+    sys.exit("ERROR: no Anna download job found")
+md5 = (row["zlib_id"] or "").lower().strip()
+if not re.fullmatch(r"[0-9a-f]{32}", md5):
+    sys.exit(f"ERROR: latest Anna job id is not an md5: {md5!r}")
+base_row = con.execute("SELECT value FROM settings WHERE key='annas.base_url'").fetchone()
+base = ((base_row[0] if base_row else "") or "https://annas-archive.gd").rstrip("/")
+con.close()
+
+cookie = cookiep.read_text().strip() if cookiep.exists() else ""
+ua = uap.read_text().strip() if uap.exists() else "Mozilla/5.0"
+headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
+if cookie:
+    headers["Cookie"] = cookie
+
+print("TITLE=" + row["title"])
+print("MD5=" + md5)
+print("BASE=" + base)
+
+def classify(text):
+    out=[]
+    if re.search(r'href="https?://[^"]+/d3/', text): out.append("D3")
+    if re.search(r'waitSeconds\s*=\s*\d+', text): out.append("WAIT")
+    if "/slow_download/" in text: out.append("SLOW_LINKS")
+    if "/md5/" + md5 in text: out.append("MD5_PAGE")
+    low=text.lower()
+    if "ddos-guard" in low or "check=1" in low and "challenge" in low: out.append("CHALLENGE")
+    if "slow downloads are only available" in low: out.append("ONLY_OFFICIAL")
+    return ",".join(out) or "OTHER"
+
+with httpx.Client(timeout=30, follow_redirects=False, headers=headers) as cx:
+    md5url = f"{base}/md5/{md5}"
+    r = cx.get(md5url)
+    print(f"MD5_1={r.status_code} LOC={r.headers.get('location','')} TYPE={classify(r.text)}")
+    if 300 <= r.status_code < 400 and r.headers.get("location"):
+        nxt = httpx.URL(md5url).join(r.headers["location"])
+        r = cx.get(str(nxt))
+        print(f"MD5_2={r.status_code} LOC={r.headers.get('location','')} TYPE={classify(r.text)}")
+
+    page = r.text
+    links = []
+    for m in re.finditer(r'href="([^"]*?/slow_download/' + re.escape(md5) + r'/\d+/\d+[^"]*)"', page):
+        u = m.group(1).replace("&amp;", "&")
+        if u.startswith("/"):
+            u = base + u
+        if u not in links:
+            links.append(u)
+    print("SLOW_LINK_COUNT=" + str(len(links)))
+
+    probe_links = links[:6] if links else [
+        f"{base}/slow_download/{md5}/0/{i}" for i in (2,1,0)
+    ]
+    for idx,u in enumerate(probe_links,1):
+        cur=u
+        for hop in range(1,4):
+            rr=cx.get(cur)
+            print(f"P{idx}_{hop}={rr.status_code} LOC={rr.headers.get('location','')} TYPE={classify(rr.text)}")
+            if 300 <= rr.status_code < 400 and rr.headers.get("location"):
+                cur=str(httpx.URL(cur).join(rr.headers["location"]))
+                continue
+            break
+PY
